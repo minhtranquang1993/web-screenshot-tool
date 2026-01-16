@@ -10,7 +10,9 @@ from datetime import datetime
 from urllib.parse import urlparse
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk, scrolledtext
+import threading
 from playwright.sync_api import sync_playwright
+from google_drive_manager import GoogleDriveManager
 
 
 def sanitize_filename(url: str) -> str:
@@ -125,6 +127,28 @@ class ScreenshotToolGUI:
         browse_btn = ttk.Button(folder_frame, text="Chọn...", command=self.browse_folder)
         browse_btn.pack(side=tk.LEFT)
         
+        # === Google Drive Section ===
+        drive_frame = ttk.LabelFrame(main_frame, text="☁️ Google Drive Support", padding="10")
+        drive_frame.pack(fill=tk.X, pady=(0, 10))
+        
+        self.use_drive_var = tk.BooleanVar(value=False)
+        self.drive_check = ttk.Checkbutton(drive_frame, text="Upload lên Google Drive", variable=self.use_drive_var, command=self.toggle_drive_ui)
+        self.drive_check.pack(side=tk.LEFT, padx=(0, 10))
+        
+        self.connect_btn = ttk.Button(drive_frame, text="🔗 Kết nối Drive", command=self.connect_drive)
+        self.connect_btn.pack(side=tk.LEFT, padx=(0, 10))
+        
+        ttk.Label(drive_frame, text="Chọn Folder:").pack(side=tk.LEFT, padx=(0, 5))
+        
+        self.drive_folder_var = tk.StringVar()
+        self.drive_folder_cb = ttk.Combobox(drive_frame, textvariable=self.drive_folder_var, width=30, state="readonly")
+        self.drive_folder_cb.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        
+        # State
+        self.drive_manager = GoogleDriveManager()
+        self.drive_folders_map = {} # name -> id
+        self.toggle_drive_ui()
+
         # === Action Buttons ===
         btn_frame = ttk.Frame(main_frame)
         btn_frame.pack(fill=tk.X, pady=(0, 10))
@@ -155,7 +179,43 @@ class ScreenshotToolGUI:
         
         self.log_text = scrolledtext.ScrolledText(main_frame, height=8, font=('Consolas', 9))
         self.log_text.pack(fill=tk.BOTH, expand=True)
+
+    def toggle_drive_ui(self):
+        """Enable/Disable Drive UI based on checkbox."""
+        state = tk.NORMAL if self.use_drive_var.get() else tk.DISABLED
+        self.connect_btn.config(state=state)
+        self.drive_folder_cb.config(state="readonly" if self.use_drive_var.get() else tk.DISABLED)
         
+    def connect_drive(self):
+        """Connects to Drive and lists folders."""
+        self.update_status("Đang kết nối Google Drive...")
+        self.connect_btn.config(state=tk.DISABLED)
+        
+        def run_auth():
+            try:
+                success = self.drive_manager.authenticate()
+                if success:
+                    folders = self.drive_manager.list_folders()
+                    self.root.after(0, lambda: self.on_auth_success(folders))
+                else:
+                     self.root.after(0, lambda: messagebox.showerror("Lỗi", "Kết nối thất bại!"))
+            except Exception as e:
+                self.root.after(0, lambda: messagebox.showerror("Lỗi", f"Lỗi kết nối: {e}"))
+            finally:
+                self.root.after(0, lambda: self.connect_btn.config(state=tk.NORMAL))
+                
+        threading.Thread(target=run_auth, daemon=True).start()
+        
+    def on_auth_success(self, folders):
+        """Callback when auth is successful."""
+        self.update_status("Kết nối Google Drive thành công!")
+        self.drive_folders_map = {f['name']: f['id'] for f in folders}
+        names = list(self.drive_folders_map.keys())
+        self.drive_folder_cb['values'] = names
+        if names:
+            self.drive_folder_cb.current(0)
+        messagebox.showinfo("Thành công", "Đã kết nối Google Drive!")
+
     def browse_folder(self):
         folder = filedialog.askdirectory(title="Chọn thư mục lưu ảnh")
         if folder:
@@ -199,6 +259,17 @@ class ScreenshotToolGUI:
             
         output_folder = self.folder_var.get()
         
+        # Check Drive requirements if enabled
+        upload_to_drive = self.use_drive_var.get()
+        drive_folder_id = None
+        
+        if upload_to_drive:
+            folder_name = self.drive_folder_var.get()
+            if not folder_name or folder_name not in self.drive_folders_map:
+                messagebox.showwarning("Lỗi Drive", "Vui lòng kết nối và chọn folder trên Drive trước!")
+                return
+            drive_folder_id = self.drive_folders_map[folder_name]
+        
         # Tạo thư mục nếu chưa tồn tại
         if not os.path.exists(output_folder):
             try:
@@ -216,7 +287,10 @@ class ScreenshotToolGUI:
         self.capture_btn.config(state=tk.DISABLED)
         
         self.log(f"🚀 Bắt đầu chụp {len(urls)} trang web...")
-        self.log(f"📁 Lưu vào: {output_folder}\n")
+        self.log(f"📁 Lưu vào: {output_folder}")
+        if upload_to_drive:
+            self.log(f"☁️ Upload lên Drive folder: {self.drive_folder_var.get()}")
+        self.log("")
         
         success_count = 0
         fail_count = 0
@@ -229,6 +303,18 @@ class ScreenshotToolGUI:
             
             if success:
                 success_count += 1
+                # Handle Upload
+                if upload_to_drive:
+                    # Extract filepath from message "✓ Đã lưu: filepath"
+                    local_path = message.replace("✓ Đã lưu: ", "").strip()
+                    if os.path.exists(local_path):
+                         self.update_status(f"Đang upload lên Drive: {os.path.basename(local_path)}")
+                         self.log(f"   ⬆️ Đang upload...")
+                         file_id = self.drive_manager.upload_file(local_path, drive_folder_id)
+                         if file_id:
+                             self.log(f"   ✅ Upload thành công (ID: {file_id})")
+                         else:
+                             self.log(f"   ❌ Upload thất bại")
             else:
                 fail_count += 1
                 
